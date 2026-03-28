@@ -9,6 +9,7 @@ import requests
 from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON
 from py_clob_client.signer import Signer
+from py_clob_client.clob_types import OrderArgs, OrderType
 
 load_dotenv()
 
@@ -48,7 +49,7 @@ def print_dashboard(event: str):
     shares, usd = get_next_bet_info()
     win_rate = round((wins / (wins + losses) * 100), 1) if (wins + losses) > 0 else 0.0
     print("\n" + "="*80)
-    print(f"🤖 POLYMARKET 5M BTC BOT - {event.upper()}")
+    print(f"\ud83e\udd16 POLYMARKET 5M BTC BOT - {event.upper()}")
     print(f"Time: {time.strftime('%H:%M:%S')} | Demo: {DEMO_MODE}")
     print(f"Round: {current_round} | Next Bet: ${usd} ({shares} shares)")
     print(f"Consecutive Losses: {consecutive_losses}/6")
@@ -60,14 +61,25 @@ def print_dashboard(event: str):
 async def init_client():
     global client
     if DEMO_MODE:
-        print("🧪 DEMO MODE ACTIVE — No real orders placed")
+        print("\ud83e\uddea DEMO MODE ACTIVE \u2014 No real orders placed")
         return
-    signer = Signer(PRIVATE_KEY, POLYGON)
-    client = ClobClient(host="https://clob.polymarket.com", chain_id=POLYGON, signer=signer, wallet_address=WALLET_ADDRESS)
-    print("✅ Live client ready")
+    try:
+        signer = Signer(PRIVATE_KEY, POLYGON)
+        client = ClobClient(
+            host="https://clob.polymarket.com",
+            chain_id=POLYGON,
+            signer=signer,
+            wallet_address=WALLET_ADDRESS
+        )
+        # Derive API credentials from wallet signature
+        client.set_api_creds(client.create_or_derive_api_creds())
+        print("\u2705 Live client ready")
+    except Exception as e:
+        print(f"\u274c Client init failed: {e}")
+        raise
 
 def get_current_btc_5m_markets():
-    """Correct event-based discovery — live window only"""
+    """Event-based discovery \u2014 live window only"""
     now = int(time.time())
     interval = 300
     current_ts = (now // interval) * interval
@@ -92,9 +104,9 @@ def get_current_btc_5m_markets():
                                 except:
                                     clob = None
                             if isinstance(clob, list) and len(clob) >= 2:
-                                up_token = str(clob[0])   # UP
-                                down_token = str(clob[1]) # DOWN
-                                print(f"✅ FOUND MARKET: {slug}")
+                                up_token = str(clob[0])
+                                down_token = str(clob[1])
+                                print(f"\u2705 FOUND MARKET: {slug}")
                                 return {
                                     "up_token_id": up_token,
                                     "down_token_id": down_token,
@@ -123,7 +135,7 @@ def get_current_btc_5m_markets():
                             if isinstance(clob, list) and len(clob) >= 2:
                                 up_token = str(clob[0])
                                 down_token = str(clob[1])
-                                print(f"✅ FOUND via active events: {event.get('slug')}")
+                                print(f"\u2705 FOUND via active events: {event.get('slug')}")
                                 return {
                                     "up_token_id": up_token,
                                     "down_token_id": down_token,
@@ -133,139 +145,28 @@ def get_current_btc_5m_markets():
     except Exception as e:
         print(f"Active events fallback error: {e}")
 
-    print("⚠️  No active BTC 5m market found yet. This is common between windows. Retrying...")
+    print("\u26a0\ufe0f  No active BTC 5m market found yet. Retrying...")
     return None
 
-async def get_best_ask(token_id: str) -> Decimal:
+def get_best_ask_sync(token_id: str) -> Decimal:
+    """Synchronous orderbook fetch \u2014 py-clob-client is not async"""
     if DEMO_MODE:
         import random
         return Decimal(str(round(0.48 + random.random() * 0.28, 4)))
     try:
-        orderbook = await client.get_order_book(token_id)
-        asks = orderbook.get("asks", [])
-        if asks:
-            return Decimal(asks[0]["price"])
-    except:
-        pass
+        orderbook = client.get_order_book(token_id)
+        # orderbook is an object with .asks attribute (list of dicts)
+        asks = getattr(orderbook, "asks", None)
+        if asks and len(asks) > 0:
+            return Decimal(str(asks[0].price))
+    except Exception as e:
+        print(f"\u26a0\ufe0f Orderbook error: {e}")
     return Decimal("0.50")
 
+async def get_best_ask(token_id: str) -> Decimal:
+    """Run sync orderbook call in thread so it doesn't block the event loop"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, get_best_ask_sync, token_id)
+
 async def print_live_prices(markets):
-    if not markets:
-        return
-    up_price = await get_best_ask(markets["up_token_id"])
-    down_price = await get_best_ask(markets["down_token_id"])
-    print(f"[{time.strftime('%H:%M:%S')}] Window: {markets['slug']}")
-    print(f"   BTC Up   → {up_price:.4f}     BTC Down → {down_price:.4f}")
-    if up_price >= ENTRY_THRESHOLD:
-        print(f"   🔥🔥 UP HIT {ENTRY_THRESHOLD} → ENTRY SIGNAL!")
-    elif down_price >= ENTRY_THRESHOLD:
-        print(f"   🔥🔥 DOWN HIT {ENTRY_THRESHOLD} → ENTRY SIGNAL!")
-    else:
-        print(f"   Waiting for either side to reach 0.65...")
-    print("-" * 80)
-
-async def place_limit_buy(token_id: str, side: str):
-    global active_order_id, position_side, position_token_id, current_shares
-    shares, usd = get_next_bet_info()
-    current_shares = shares
-    print(f"🚀 {side} HIT {ENTRY_THRESHOLD} → BUYING {shares} shares @ ${BUY_LIMIT_PRICE} (${usd} USD)")
-    if DEMO_MODE:
-        print("🧪 DEMO: Buy order SIMULATED")
-        active_order_id = "demo-" + str(int(time.time()))
-        position_side = side
-        position_token_id = token_id
-        return
-    try:
-        order = await client.create_and_post_order({
-            "tokenID": token_id,
-            "price": float(BUY_LIMIT_PRICE),
-            "size": float(shares),
-            "side": "BUY",
-        })
-        active_order_id = order.get("orderID")
-        position_side = side
-        position_token_id = token_id
-        print(f"✅ REAL Order placed: {active_order_id}")
-    except Exception as e:
-        print(f"❌ Order failed: {e}")
-
-async def close_position(reason: str):
-    global active_order_id, total_pnl, last_trade_pnl, wins, losses, consecutive_losses, current_round, current_shares
-    shares = current_shares
-    if reason == "TP":
-        pnl = round(shares * 0.38, 2)
-        last_trade_pnl = pnl
-        total_pnl += pnl
-        wins += 1
-        consecutive_losses = 0
-        current_round = 1
-        print(f"🎉 TAKE PROFIT (+${pnl:.2f})")
-    else:
-        pnl = round(shares * -0.15, 2)
-        last_trade_pnl = pnl
-        total_pnl += pnl
-        losses += 1
-        consecutive_losses += 1
-        if consecutive_losses >= 6:
-            print("🔄 6 losses → HARD RESET to Round 1")
-            consecutive_losses = 0
-            current_round = 1
-        else:
-            current_round += 1
-            print(f"❌ STOP LOSS (-${abs(pnl):.2f}) → Next Round {current_round}")
-    print_dashboard(f"{reason} COMPLETE")
-    active_order_id = None
-
-async def monitor_prices():
-    global active_order_id, position_side, position_token_id, current_window_end
-    print("🤖 Bot started — using correct event-based Gamma API discovery\n")
-    print_dashboard("STARTUP")
-
-    last_print = 0
-    while True:
-        markets = get_current_btc_5m_markets()
-        if markets:
-            if markets.get("window_end") != current_window_end:
-                print(f"🕒 NEW 5-MIN WINDOW → {markets.get('slug')}")
-                active_order_id = None
-                position_side = None
-                current_window_end = markets.get("window_end")
-                print_dashboard("NEW WINDOW")
-
-            if time.time() - last_print > 2.5:
-                await print_live_prices(markets)
-                last_print = time.time()
-
-            if active_order_id is None and position_side is None:
-                up_price = await get_best_ask(markets["up_token_id"])
-                down_price = await get_best_ask(markets["down_token_id"])
-                if up_price >= ENTRY_THRESHOLD:
-                    await place_limit_buy(markets["up_token_id"], "UP")
-                elif down_price >= ENTRY_THRESHOLD:
-                    await place_limit_buy(markets["down_token_id"], "DOWN")
-        else:
-            if time.time() - last_print > 20:
-                print("⚠️  Still waiting for active BTC 5m market...")
-                last_print = time.time()
-
-        await asyncio.sleep(0.2)
-
-async def monitor_position():
-    global active_order_id
-    while True:
-        if active_order_id and DEMO_MODE:
-            import random
-            if random.random() < 0.18:
-                if random.random() < 0.65:
-                    await close_position("TP")
-                else:
-                    await close_position("SL")
-        await asyncio.sleep(0.25)
-
-async def main():
-    await init_client()
-    await asyncio.gather(monitor_prices(), monitor_position())
-
-if __name__ == "__main__":
-    asyncio.run(main())
-                            
+    if
